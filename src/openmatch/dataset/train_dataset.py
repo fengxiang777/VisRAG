@@ -65,6 +65,7 @@ class TrainDatasetBase:
 class StreamTrainDatasetMixin(IterableDataset):
     def _prepare_data(self, data_args, shuffle_seed, cache_dir):
         super()._prepare_data(data_args, shuffle_seed, cache_dir)
+        self.cache_dir = cache_dir  # Save cache_dir for later use
         if self.from_hf_repo:
             logger.info("Loading dataset from HuggingFace repo.")
             self.dataset = load_dataset(
@@ -85,8 +86,72 @@ class StreamTrainDatasetMixin(IterableDataset):
         if self.data_args.train_dir is not None:
             if (self.from_hf_repo):
                 logger.info("Loading dataset length from HuggingFace repo.")
-                return self.dataset.info.splits['train'].num_examples
-                logger.info(f"Dataset length loaded from HuggingFace repo.")
+                try:
+                    # For streaming datasets, info might not be available directly
+                    # Try to get it from the dataset's info attribute
+                    if hasattr(self.dataset, 'info') and self.dataset.info is not None:
+                        if hasattr(self.dataset.info, 'splits') and 'train' in self.dataset.info.splits:
+                            num_examples = self.dataset.info.splits['train'].num_examples
+                            if num_examples is not None:
+                                logger.info(f"Dataset length loaded from HuggingFace repo: {num_examples}")
+                                return num_examples
+                    
+                    # If info is not available, try to load dataset info from HuggingFace API
+                    logger.warning("Cannot get dataset length from streaming dataset info. Trying to load dataset info from HuggingFace API...")
+                    from datasets import load_dataset_builder
+                    try:
+                        cache_dir = getattr(self, 'cache_dir', None) or (self.data_args.data_cache_dir if hasattr(self.data_args, 'data_cache_dir') else None)
+                        builder = load_dataset_builder(self.data_files[0], cache_dir=cache_dir)
+                        if builder.info is not None and hasattr(builder.info, 'splits') and 'train' in builder.info.splits:
+                            num_examples = builder.info.splits['train'].num_examples
+                            if num_examples is not None:
+                                logger.info(f"Dataset length loaded from HuggingFace API: {num_examples}")
+                                return num_examples
+                    except Exception as e:
+                        logger.warning(f"Failed to load dataset info from HuggingFace API: {e}")
+                    
+                    # If cannot get length from HuggingFace, try to fallback to local metadata.json
+                    logger.info("Cannot get dataset length from HuggingFace. Trying to load from local metadata.json...")
+                    metadata_path = os.path.join(self.data_args.train_dir, "metadata.json")
+                    if os.path.exists(metadata_path):
+                        try:
+                            with open(metadata_path, 'r') as f:
+                                metadata = json.loads(f.read())
+                                length = int(metadata["length"])
+                                logger.info(f"Dataset length loaded from local metadata.json: {length}")
+                                return length
+                        except Exception as e:
+                            logger.warning(f"Failed to load metadata.json: {e}")
+                    
+                    # If all methods fail, raise an informative error
+                    raise ValueError(
+                        "Cannot determine dataset length from streaming HuggingFace dataset. "
+                        "Please either:\n"
+                        "1. Set --max_steps in training arguments, or\n"
+                        "2. Use --use_mapping_dataset to load the full dataset (non-streaming), or\n"
+                        "3. Provide a metadata.json file with 'length' field in the train_dir"
+                    )
+                except ValueError:
+                    raise
+                except Exception as e:
+                    logger.error(f"Error loading dataset length: {e}")
+                    # Try to fallback to local metadata.json even if there's an error
+                    logger.info("Trying to load dataset length from local metadata.json as fallback...")
+                    metadata_path = os.path.join(self.data_args.train_dir, "metadata.json")
+                    if os.path.exists(metadata_path):
+                        try:
+                            with open(metadata_path, 'r') as f:
+                                metadata = json.loads(f.read())
+                                length = int(metadata["length"])
+                                logger.info(f"Dataset length loaded from local metadata.json: {length}")
+                                return length
+                        except Exception as e2:
+                            logger.warning(f"Failed to load metadata.json: {e2}")
+                    
+                    raise ValueError(
+                        f"Failed to get dataset length: {e}. "
+                        "Please set --max_steps in training arguments or use --use_mapping_dataset."
+                    )
             else:
                 logger.info("load dataset length from metadata...")
                 metadata_path = os.path.join(self.data_args.train_dir, "metadata.json")
