@@ -28,14 +28,21 @@ MASTER_ENDPOINT=localhost
 MASTER_PORT=23456
 
 TIMESTR=$(date "+%Y-%m-%d-%H%M%S")
-IDENTITY="train-$TIMESTR-model-data-lr-$LR-softm_temp-$SOFTMAX_TEMPERATURE-bsz$PER_DEV_BATCH_SIZE-ngpus$GPUS_PER_NODE-nnodes$WORLD_SIZE-inbatch-$IN_BATCH-nepoch-$EPOCH-pooling-$POOLING-attention-$ATTENTION-qinstruct-$QUERY_INSTRUCTION-cinstruct-$CORPUS_INSTRUCTION-gradcache-$GRADCACHE-passage-stopgrad-$PASSAGE_STOP_GRAD-npassage-$NPASSAGE"
 CHECKPOINT_DIR=./checkpoints
 LOG_DIR=./tensorboard
 IN_BATCH=true
+IDENTITY="train-$TIMESTR-model-data-lr-$LR-softm_temp-$SOFTMAX_TEMPERATURE-bsz$PER_DEV_BATCH_SIZE-ngpus$GPUS_PER_NODE-nnodes$WORLD_SIZE-inbatch-$IN_BATCH-nepoch-$EPOCH-pooling-$POOLING-attention-$ATTENTION-qinstruct-$QUERY_INSTRUCTION-cinstruct-$CORPUS_INSTRUCTION-gradcache-$GRADCACHE-passage-stopgrad-$PASSAGE_STOP_GRAD-npassage-$NPASSAGE"
 LORA=false
 LORA_R=32
 MAX_Q_LEN=$MAX_SEQ_LEN
 MAX_P_LEN=$MAX_SEQ_LEN
+
+if [ "$GPUS_PER_NODE" != "1" ]; then
+    echo "[警告] 已切换至单卡模式，忽略传入的 GPUS_PER_NODE=$GPUS_PER_NODE"
+    GPUS_PER_NODE=1
+fi
+
+export CUDA_VISIBLE_DEVICES=${CUDA_VISIBLE_DEVICES:-0}
 
 
 if [[ $MODEL_PATH != *"SigLIP"* ]]; then
@@ -46,14 +53,7 @@ fi
 
 echo attn_implementation: $attn_implementation
 
-
-TORCH_DISTRIBUTED_DEBUG=DETAIL torchrun \
-    --nnodes=$WORLD_SIZE \
-    --node_rank=$RANK \
-    --nproc_per_node=$GPUS_PER_NODE \
-    --master_addr=$MASTER_ENDPOINT \
-    --master_port=$MASTER_PORT \
-    src/openmatch/driver/train.py \
+python -m src.openmatch.driver.train \
     --overwrite_output_dir \
     --output_dir "$CHECKPOINT_DIR/$IDENTITY" \
     --model_name_or_path $MODEL_PATH \
