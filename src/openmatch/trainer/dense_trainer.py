@@ -177,12 +177,17 @@ class DRTrainer(Trainer):
 
     def log(self, log_dict): # overwrite Trainer.log [hacked]
         if len(self.metric_hook["accuracy"]) != 0:
-            log_dict["accuracy"] = sum(self.metric_hook["accuracy"]) / len(self.metric_hook["accuracy"])
+            accuracy_list = self.metric_hook["accuracy"]
+            if len(accuracy_list) > 0:
+                log_dict["accuracy"] = sum(accuracy_list) / len(accuracy_list)
             self.metric_hook["accuracy"] = []
 
         # when logging
         if "loss" in log_dict:
-            log_dict["loss"] = log_dict["loss"] / self.world_size
+            if self.world_size > 0:
+                log_dict["loss"] = log_dict["loss"] / self.world_size
+            else:
+                logger.warning(f"world_size is {self.world_size}, skipping loss division")
                 
         super().log(log_dict)
     
@@ -356,11 +361,28 @@ class DRTrainer(Trainer):
                         if self.state.global_step == 0:
                             logger.info(f"    process #{self.process_rank}: {i * global_micro_bsz + self.process_rank * micro_bsz} -> {i * global_micro_bsz + (self.process_rank + 1) * micro_bsz}")
                         
+                        # Calculate indices for this micro-batch
+                        q_start_idx = i * global_micro_bsz + self.process_rank * micro_bsz
+                        q_end_idx = i * global_micro_bsz + (self.process_rank + 1) * micro_bsz
+                        p_start_idx = q_start_idx * n_passages
+                        p_end_idx = q_end_idx * n_passages
+                        
+                        # Validate indices
+                        if q_end_idx > q_reps_cache.size(0):
+                            logger.error(f"Query index out of range: q_end_idx={q_end_idx}, q_reps_cache.size(0)={q_reps_cache.size(0)}")
+                            logger.error(f"i={i}, global_micro_bsz={global_micro_bsz}, process_rank={self.process_rank}, micro_bsz={micro_bsz}")
+                            raise ValueError(f"Query index out of range: {q_end_idx} > {q_reps_cache.size(0)}")
+                        
+                        if p_end_idx > p_reps_cache.size(0):
+                            logger.error(f"Passage index out of range: p_end_idx={p_end_idx}, p_reps_cache.size(0)={p_reps_cache.size(0)}")
+                            logger.error(f"q_start_idx={q_start_idx}, q_end_idx={q_end_idx}, n_passages={n_passages}")
+                            raise ValueError(f"Passage index out of range: {p_end_idx} > {p_reps_cache.size(0)}")
+                        
                         # for this, please refer to the above "Composition of q_reps_"
                         q_reps_tmp = q_reps_cache.clone()
-                        q_reps_tmp[i * global_micro_bsz + self.process_rank * micro_bsz: i * global_micro_bsz + (self.process_rank + 1) * micro_bsz] = q_reps_
+                        q_reps_tmp[q_start_idx:q_end_idx] = q_reps_
                         p_reps_tmp = p_reps_cache.clone()
-                        p_reps_tmp[(i * global_micro_bsz + self.process_rank * micro_bsz) * n_passages: (i * global_micro_bsz + (self.process_rank + 1) * micro_bsz) *  n_passages] = p_reps_
+                        p_reps_tmp[p_start_idx:p_end_idx] = p_reps_
                         
                         # compute loss
                         if self.args.biaxial_loss:
@@ -370,17 +392,46 @@ class DRTrainer(Trainer):
                             if self.state.global_step == 0:
                                 logger.info(f"    scores.shape = {scores.shape}")
                                 logger.info(f"    softmax_temperature = {self.args.softmax_temperature}")
+                                logger.info(f"    q_reps_tmp.shape = {q_reps_tmp.shape}, p_reps_tmp.shape = {p_reps_tmp.shape}")
                                 
+                            # Check for NaN/Inf in scores before division
+                            if torch.isnan(scores).any() or torch.isinf(scores).any():
+                                logger.error(f"NaN or Inf detected in scores before temperature scaling!")
+                                logger.error(f"scores stats: min={scores.min()}, max={scores.max()}, mean={scores.mean()}")
+                                raise ValueError("NaN or Inf in scores")
+                            
+                            # Ensure softmax_temperature is not zero or too small
+                            if self.args.softmax_temperature <= 0:
+                                raise ValueError(f"softmax_temperature must be positive, got {self.args.softmax_temperature}")
+                            
                             scores = scores / self.args.softmax_temperature
+                            
+                            # Check for NaN/Inf after division
+                            if torch.isnan(scores).any() or torch.isinf(scores).any():
+                                logger.error(f"NaN or Inf detected in scores after temperature scaling!")
+                                logger.error(f"scores stats: min={scores.min()}, max={scores.max()}, mean={scores.mean()}")
+                                raise ValueError("NaN or Inf in scores after temperature scaling")
                             
                             # one query, multiple passage (only one positive passage, others are all negatives)
                             target = torch.arange(scores.size(0), device=scores.device, dtype=torch.long) # shape [B, 1] where 1 is an index from 0 to B*n_train_docs
                             target = target * n_passages
                             
+                            # Check if target indices are valid
+                            if target.max() >= scores.size(1):
+                                logger.error(f"Target index {target.max()} out of range for scores.shape[1]={scores.size(1)}")
+                                logger.error(f"target.shape={target.shape}, scores.shape={scores.shape}, n_passages={n_passages}")
+                                raise ValueError(f"Target indices out of range: max_target={target.max()}, scores_cols={scores.size(1)}")
+                            
                             if self.state.global_step == 0:
-                                logger.info(f"    target.shape = {target.shape}")
+                                logger.info(f"    target.shape = {target.shape}, target range: [{target.min()}, {target.max()}]")
                             
                             loss = F.cross_entropy(scores, target, reduction='mean')
+                            
+                            # Check for NaN/Inf in loss
+                            if torch.isnan(loss) or torch.isinf(loss):
+                                logger.error(f"NaN or Inf detected in loss!")
+                                logger.error(f"loss value: {loss}, scores stats: min={scores.min()}, max={scores.max()}")
+                                raise ValueError("NaN or Inf in loss")
                             
                             # In distributed training, global CE backward will give one gpu its own gradient, 
                             # But DDP will average the gradient of all gpus, here, an extra mean is introduced. 
@@ -429,7 +480,25 @@ class DRTrainer(Trainer):
                     
                     scores = torch.matmul(q_reps, p_reps.transpose(0, 1))
                     logger.info(f"scores.shape = {scores.shape}")
+                    
+                    # Check for NaN/Inf in scores before division
+                    if torch.isnan(scores).any() or torch.isinf(scores).any():
+                        logger.error(f"NaN or Inf detected in scores before temperature scaling!")
+                        logger.error(f"scores stats: min={scores.min()}, max={scores.max()}, mean={scores.mean()}")
+                        raise ValueError("NaN or Inf in scores")
+                    
+                    # Ensure softmax_temperature is not zero or too small
+                    if self.args.softmax_temperature <= 0:
+                        raise ValueError(f"softmax_temperature must be positive, got {self.args.softmax_temperature}")
+                    
                     scores = scores / self.args.softmax_temperature
+                    
+                    # Check for NaN/Inf after division
+                    if torch.isnan(scores).any() or torch.isinf(scores).any():
+                        logger.error(f"NaN or Inf detected in scores after temperature scaling!")
+                        logger.error(f"scores stats: min={scores.min()}, max={scores.max()}, mean={scores.mean()}")
+                        raise ValueError("NaN or Inf in scores after temperature scaling")
+                    
                     target = torch.arange(scores.size(0), device=scores.device, dtype=torch.long)
 
                     n_passages = self.train_dataset.data_args.train_n_passages
@@ -438,7 +507,20 @@ class DRTrainer(Trainer):
                         raise NotImplementedError("Biaxial loss is forbidden now.")
                     else:
                         target = target * n_passages
+                        
+                        # Check if target indices are valid
+                        if target.max() >= scores.size(1):
+                            logger.error(f"Target index {target.max()} out of range for scores.shape[1]={scores.size(1)}")
+                            logger.error(f"target.shape={target.shape}, scores.shape={scores.shape}, n_passages={n_passages}")
+                            raise ValueError(f"Target indices out of range: max_target={target.max()}, scores_cols={scores.size(1)}")
+                        
                         loss = F.cross_entropy(scores, target, reduction='mean')
+                        
+                        # Check for NaN/Inf in loss
+                        if torch.isnan(loss) or torch.isinf(loss):
+                            logger.error(f"NaN or Inf detected in loss!")
+                            logger.error(f"loss value: {loss}, scores stats: min={scores.min()}, max={scores.max()}")
+                            raise ValueError("NaN or Inf in loss")
                         
                     # In distributed training, global CE backward will give one gpu its own gradient, 
                     # But DDP will average the gradient of all gpus, here, an extra mean is introduced. 
@@ -456,6 +538,10 @@ class DRTrainer(Trainer):
 
             self.accelerator.backward(loss)
 
+        # Ensure gradient_accumulation_steps is positive
+        if self.args.gradient_accumulation_steps <= 0:
+            raise ValueError(f"gradient_accumulation_steps must be positive, got {self.args.gradient_accumulation_steps}")
+        
         return loss.detach() / self.args.gradient_accumulation_steps
 
 
