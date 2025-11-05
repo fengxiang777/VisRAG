@@ -1,10 +1,22 @@
+#!/bin/bash
 # For deepspeed
 export PATH=/usr/local/cuda/bin:$PATH
 
 # Get the script directory and change to it to ensure relative paths work
 SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 PROJECT_ROOT="$(cd "$SCRIPT_DIR/../.." && pwd)"
-cd "$PROJECT_ROOT" || exit 1
+cd "$PROJECT_ROOT" || {
+    echo "Error: Cannot change to project root directory: $PROJECT_ROOT"
+    exit 1
+}
+
+# Verify we're in the right directory
+if [ ! -f "src/openmatch/driver/train.py" ]; then
+    echo "Error: Cannot find src/openmatch/driver/train.py"
+    echo "Current directory: $(pwd)"
+    echo "Please run this script from the project root directory."
+    exit 1
+fi
 
 # on each node, the script will only run once.
 MAX_SEQ_LEN=$1
@@ -50,8 +62,28 @@ fi
 
 echo attn_implementation: $attn_implementation
 
+# Try to find torchrun or use python -m torch.distributed.run
+# First try python from current environment
+if command -v python &> /dev/null && python -m torch.distributed.run --help &> /dev/null 2>&1; then
+    TORCHRUN_CMD="python -m torch.distributed.run"
+elif command -v torchrun &> /dev/null; then
+    TORCHRUN_CMD="torchrun"
+elif command -v python3 &> /dev/null && python3 -m torch.distributed.run --help &> /dev/null 2>&1; then
+    TORCHRUN_CMD="python3 -m torch.distributed.run"
+else
+    echo "Error: torchrun not found. Please ensure:"
+    echo "  1. PyTorch is installed"
+    echo "  2. Conda environment is activated (e.g., conda activate VisRAG)"
+    echo "  3. Python/PyTorch is in your PATH"
+    echo ""
+    echo "Current Python: $(which python 2>/dev/null || which python3 2>/dev/null || echo 'not found')"
+    exit 1
+fi
 
-TORCH_DISTRIBUTED_DEBUG=DETAIL torchrun \
+echo "Using: $TORCHRUN_CMD"
+echo "Python: $(python --version 2>&1 || python3 --version 2>&1 || echo 'unknown')"
+
+TORCH_DISTRIBUTED_DEBUG=DETAIL $TORCHRUN_CMD \
     --nnodes=$WORLD_SIZE \
     --node_rank=$RANK \
     --nproc_per_node=$GPUS_PER_NODE \
