@@ -110,6 +110,19 @@ class StreamTrainDatasetMixin(IterableDataset):
                     except Exception as e:
                         logger.warning(f"Failed to load dataset info from HuggingFace API: {e}")
                     
+                    # If cannot get length from HuggingFace, try to fallback to local metadata.json
+                    logger.info("Cannot get dataset length from HuggingFace. Trying to load from local metadata.json...")
+                    metadata_path = os.path.join(self.data_args.train_dir, "metadata.json")
+                    if os.path.exists(metadata_path):
+                        try:
+                            with open(metadata_path, 'r') as f:
+                                metadata = json.loads(f.read())
+                                length = int(metadata["length"])
+                                logger.info(f"Dataset length loaded from local metadata.json: {length}")
+                                return length
+                        except Exception as e:
+                            logger.warning(f"Failed to load metadata.json: {e}")
+                    
                     # If all methods fail, raise an informative error
                     raise ValueError(
                         "Cannot determine dataset length from streaming HuggingFace dataset. "
@@ -122,6 +135,19 @@ class StreamTrainDatasetMixin(IterableDataset):
                     raise
                 except Exception as e:
                     logger.error(f"Error loading dataset length: {e}")
+                    # Try to fallback to local metadata.json even if there's an error
+                    logger.info("Trying to load dataset length from local metadata.json as fallback...")
+                    metadata_path = os.path.join(self.data_args.train_dir, "metadata.json")
+                    if os.path.exists(metadata_path):
+                        try:
+                            with open(metadata_path, 'r') as f:
+                                metadata = json.loads(f.read())
+                                length = int(metadata["length"])
+                                logger.info(f"Dataset length loaded from local metadata.json: {length}")
+                                return length
+                        except Exception as e2:
+                            logger.warning(f"Failed to load metadata.json: {e2}")
+                    
                     raise ValueError(
                         f"Failed to get dataset length: {e}. "
                         "Please set --max_steps in training arguments or use --use_mapping_dataset."
