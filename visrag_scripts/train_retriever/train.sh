@@ -1,6 +1,10 @@
 # For deepspeed
 export PATH=/usr/local/cuda/bin:$PATH
 
+# Get the script directory and change to it to ensure relative paths work
+SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
+PROJECT_ROOT="$(cd "$SCRIPT_DIR/../.." && pwd)"
+cd "$PROJECT_ROOT" || exit 1
 
 # on each node, the script will only run once.
 MAX_SEQ_LEN=$1
